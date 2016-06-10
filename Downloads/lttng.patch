@@ -1,0 +1,495 @@
+diff --git a/benchmark.txt b/benchmark.txt
+index a2595f0..e883a59 100644
+--- a/benchmark.txt
++++ b/benchmark.txt
+@@ -48,4 +48,4 @@ export BENCHMARK_INTERVAL=120
+ 
+ if run by hand:
+ 
+-ssh -o ServerAliveInterval=60 root@init5-2 "cd /home/scott/medium_next; /opt/Purity/bin/pureloaddet -o vm-4096 -l -i longlat=10000,size=4096 -m maxthreads=24,
++ssh -o ServerAliveInterval=60 root@init5-2 "cd /home/scott/medium_next; /opt/Purity/bin/pureloaddet -o vm-4096 -l -i longlat=10000,size=4096 -m maxthreads=24,warmup=5,interval=120,incrthreads=4,maxlat=2000000,initthreads=4,maxoff=32768 perf_vm_4096_00 perf_vm_4096_01"
+diff --git a/kernel/include/osenv/fake_lttng.h b/kernel/include/osenv/fake_lttng.h
+index a4a7057..4c90d12 100644
+--- a/kernel/include/osenv/fake_lttng.h
++++ b/kernel/include/osenv/fake_lttng.h
+@@ -1,3 +1,5 @@
++#ifdef DO_WE_HAVE_LTTNG_YET
++
+ #pragma once
+ 
+ #if defined(PS_TOOLSET_MSVC)
+@@ -23,3 +25,5 @@ static inline void tracepoint_dummy(...) { }
+ #define tracepoint(...)
+ 
+ #endif
++
++#endif
+diff --git a≈ b/kernel/include/osenv/fiber.h
+index ff417e7..97c2c57 100644
+--- a/kernel/include/osenv/fiber.h
++++ b/kernel/include/osenv/fiber.h
+@@ -5,6 +5,10 @@
+ #include <osenv/osenv.h>
+ #include <osenv/scheduler_tools.h>
+ #include <osenv/shmem_traits.h>
++#include <osenv/tracepoints.h>
++
++#include <atomic>
++#include <typeinfo>
+ 
+ namespace osenv {
+ 
+@@ -28,7 +32,7 @@ namespace osenv {
+ 
+ #define FOR_STREAM_CURSOR(strm) FOR_STREAM((strm), (strm))
+ 
+-        PS_OSENV_PUBLIC extern local_ptr<fiber *> current_fiber;
++        PS_OSENV_PUBLIC extern thread_local fiber * current_fiber;
+ 
+         // The # of pages for stack + guard should be odd, to encourage each stack to be at a
+         // different offset, to reduce cpu cache collisions.
+@@ -217,7 +221,8 @@ namespace osenv {
+          */
+         struct fiber : protected os_fiber {
+         public:
+-                fiber() : notify_func_(nullptr), num_context_switches_(0), running_(false) { }
++                fiber() : notify_func_(nullptr), num_context_switches_(0), running_(false),
++                          fiber_id_(fiber_id_counter_++){ }
+ 
+                 ~fiber() {
+                         PS_ASSERT(!notify_func_);
+@@ -236,7 +241,7 @@ namespace osenv {
+                 // completion.  If the request returns an error, it is returned (i.e. it is not
+                 // automatically passed up the chain).
+                 static fiber_err wait_on(req & work) {
+-                        fiber * f = *current_fiber;
++                        fiber * f = current_fiber;
+                         return f->switch_out(work);
+                 }
+ 
+@@ -268,6 +273,10 @@ namespace osenv {
+                         }
+                 }
+ 
++                static uint32_t fiber_id() {
++                        return current_fiber->fiber_id_;
++                }
++
+                 // Helper function for asynchronous callers of the fiber.  Runs the fiber until it
+                 // returns (possibly with an error), and notifies the caller of the completion.
+                 void start(ps_notify_f notify_func, void * notify_param) {
+@@ -279,7 +288,7 @@ namespace osenv {
+                 }
+ 
+                 static uint32_t num_context_switches() {
+-                        return (*current_fiber)->num_context_switches_;
++                        return current_fiber->num_context_switches_;
+                 }
+ 
+                 template<typename post_cb_f>
+@@ -308,11 +317,24 @@ namespace osenv {
+                 // Switch into the fiber, passing the (usually nullptr) error to it.
+                 fiber_pass_value switch_in(ps_err * err) {
+                         num_context_switches_++;
+-                        fiber ** fiber_ptr = current_fiber.get();
+-                        fiber * calling_fiber = *fiber_ptr;
+-                        *fiber_ptr = this;
++                        fiber * calling_fiber = current_fiber;
++                        current_fiber = this;
++                        tracepoint(foed, fiber_switch,
++                                   calling_fiber ? calling_fiber->fiber_id_ : 0, fiber_id_);
+                         uintptr_t ret = context_switch((uintptr_t)err);
+-                        *fiber_ptr = calling_fiber;
++                        fiber_pass_value out(ret);
++                        tracepoint(foed, fiber_switch,
++                                   fiber_id_, calling_fiber ? calling_fiber->fiber_id_ : 0);
++                        /*
++                        if (out.is_req()) {
++                                tracef("%u: run req %s",
++                                       fiber_id_, typeid(*out.req()).name());
++                        } else {
++                                tracef("%u: finished err %p",
++                                       fiber_id_, out.err());
++                        }
++                        */
++                        current_fiber = calling_fiber;
+                         return ret;
+                 }
+ 
+@@ -347,6 +369,8 @@ namespace osenv {
+                 void *                  notify_param_;
+                 uint32_t                num_context_switches_;
+                 bool                    running_;
++                uint32_t                fiber_id_;
++                static std::atomic<uint32_t> fiber_id_counter_;
+ 
+         private:
+                 template<class T>
+diff --git a/kernel/osenv/affinity_inherent.cpp b/kernel/osenv/affinity_inherent.cpp
+index f7fa385..ac13486 100644
+--- a/kernel/osenv/affinity_inherent.cpp
++++ b/kernel/osenv/affinity_inherent.cpp
+@@ -26,6 +26,8 @@
+ #include <defs/algo.h>
+ #include <defs/toolset.h>
+ 
++#include <lttng/tracef.h>
++
+ #include <algorithm>
+ #include <memory>
+ #include <vector>
+@@ -844,6 +846,17 @@ struct affinity_inherent_master :
+                 threaded_pool_parent_owner.reset();
+         }
+ 
++        void * map(size_t sz, res_sample const & s_, size_t phase)
++        {
++                //tracef("inherent map %lu", sz);
++                return affinity_inherent_base::map(sz, s_, phase);
++        }
++
++        void unmap(void * p)
++        {
++                //tracef("inherent unmap");
++                affinity_inherent_base::unmap(p);
++        }
+ 
+         // Overrides
+ 
+diff --git a/kernel/osenv/fiber.cpp b/kernel/osenv/fiber.cpp
+index 52a7720..6600a8d 100644
+--- a/kernel/osenv/fiber.cpp
++++ b/kernel/osenv/fiber.cpp
+@@ -2,8 +2,9 @@
+ 
+ using namespace osenv;
+ 
+-local_ptr<fiber *> osenv::current_fiber;
++thread_local fiber * osenv::current_fiber = nullptr;
+ fiber::placeholder_error fiber::fiber_cancel;
++std::atomic<uint32_t> fiber::fiber_id_counter_;
+ 
+ void fiber::notify(void * param, ps_err * err)
+ {
+diff --git a/kernel/osenv/unix/fiber.cpp b/kernel/osenv/unix/fiber.cpp
+index dba170f..a258021 100644
+--- a/kernel/osenv/unix/fiber.cpp
++++ b/kernel/osenv/unix/fiber.cpp
+@@ -4,7 +4,9 @@
+ 
+ #include <atomic>
+ 
++#include <lttng/tracef.h>
+ #include <sys/mman.h>
++#include <execinfo.h>
+ 
+ using namespace osenv;
+ 
+@@ -82,6 +84,7 @@ uintptr_t os_fiber::context_switch(uintptr_t pass) {
+ static std::atomic<unsigned> num_fibers(0);
+ 
+ void * fiber_stack::operator new(size_t sz) {
++        tracef("creating fiber stack");
+         // If this returns fails, we'll crash soon enough.
+         char * ptr =
+                 (char *)mmap(NULL, fiber_stack_size + fiber_guard_size, PROT_READ | PROT_WRITE,
+@@ -95,6 +98,7 @@ void * fiber_stack::operator new(size_t sz) {
+ }
+ 
+ void fiber_stack::operator delete(void * ptr) {
++        tracef("deleting fiber stack");
+         if (munmap(ptr, fiber_stack_size + fiber_guard_size) != 0) {
+                 int err = errno;
+                 d_.info("failed to free stack, errno %%", err);
+@@ -103,6 +107,56 @@ void fiber_stack::operator delete(void * ptr) {
+         }
+ }
+ 
++
++// HACK: Adding pthread mutex tracing here
++extern "C" {
++
++static __thread int thread_in_trace;
++
++int pthread_mutex_lock(pthread_mutex_t * mut)
++{
++        static int (*orig_mutex_lock)(pthread_mutex_t *) = nullptr;
++        if (!orig_mutex_lock) {
++                orig_mutex_lock = (int (*)(pthread_mutex_t*))dlsym(RTLD_NEXT, "pthread_mutex_lock");
++        }
++
++        if (thread_in_trace) {
++                return orig_mutex_lock(mut);
++        }
++
++        if (!pthread_mutex_trylock(mut)) {
++                return 0;
++        }
++
++        thread_in_trace = 1;
++        tracef("mutex slow lock req %p", mut);
++        int ret = orig_mutex_lock(mut);
++        tracef("mutex lock acq %p", mut);
++        thread_in_trace = 0;
++
++        return ret;
++}
++        /*
++int pthread_mutex_unlock(pthread_mutex_t * mut)
++{
++        static int (*orig_mutex_unlock)(pthread_mutex_t *) = nullptr;
++        if (!orig_mutex_unlock) {
++                orig_mutex_unlock = (int (*)(pthread_mutex_t*))dlsym(RTLD_NEXT, "pthread_mutex_unlock");
++        }
++
++        if (thread_in_trace) {
++                return orig_mutex_unlock(mut);
++        }
++        thread_in_trace = 1;
++        tracef("mutex unlock %p", mut);
++        int ret = orig_mutex_unlock(mut);
++        thread_in_trace = 0;
++        return ret;
++}
++        */
++
++};
++
+ // 28 stacks per thread, 96 threads, plus 1000 shared stacks = 28 * 96 + 1000 = 3688 stacks
+ // 3688 stacks @ 32kB each = max 118MB wasted.
+ // Having a batch size of 14 means object_batch fits evenly in 128 bytes.
+diff --git a/kernel/vol/device_bus_local.cpp b/kernel/vol/device_bus_local.cpp
+index b8962e7..a09620c 100644
+--- a/kernel/vol/device_bus_local.cpp
++++ b/kernel/vol/device_bus_local.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include <sstream>
+ #include <string.h>
++#include <lttng/tracef.h>
+ 
+ using namespace boot;
+ using namespace defs;
+diff --git a/kernel/vol/flush.cpp b/kernel/vol/flush.cpp
+index b2c8cb7..0d0bb2a 100644
+--- a/kernel/vol/flush.cpp
++++ b/kernel/vol/flush.cpp
+@@ -217,8 +217,10 @@ flush_root_impl::add_node(device_batch_node * node)
+ 
+         root->get_stats( node->checkpoint.silo_id ).seq_cohort = node->checkpoint.seq_end;
+ 
++        /*
+         tracepoint(vol, seq_cohort, node->checkpoint.silo_id,
+                         node->checkpoint.seq_end);
++        */
+ 
+         // Place this into the pending set of nodes.
+         if ( !!atomic_push(&root->cohort, node, &device_batch_node::tamp_next) ) {
+diff --git a/kernel/vol/medium_next.cpp b/kernel/vol/medium_next.cpp
+index 06ffb78..19082ad 100644
+--- a/kernel/vol/medium_next.cpp
++++ b/kernel/vol/medium_next.cpp
+@@ -1,3 +1,5 @@
++#include <lttng/tracef.h>
++
+ #include "medium_impl.h"
+ #include "device.h"
+ 
+@@ -1860,6 +1862,8 @@ struct medium_debt_svc_impl :
+                 // Used to ensure we emit mediums in order when possible.
+                 uint64_t        next_vol = 0;
+ 
++                uint64_t        buckets[65];
++
+                 segio_fill_stream(medium_debt_svc_impl * parent_, ps_segio & segio_)
+                         : parent(parent_)
+                         , segio(segio_)
+@@ -1876,6 +1880,10 @@ struct medium_debt_svc_impl :
+                                 parent->fillers_tuples,
+                                 parent->num_filling_segio,
+                                 parent->num_open_segio.load());
++                        tracef("Starting segio fill for (%ld, %d) (%ld pending tuples, %d concurrent fillers, %d open segios)",
++                               segio_h.seg_id, segio_h.io, parent->fillers_tuples, parent->num_filling_segio,
++                               parent->num_open_segio.load());
++                        memset(buckets, 0, sizeof(buckets));
+                 }
+ 
+                 ~segio_fill_stream() {
+@@ -4932,6 +4940,8 @@ private:
+                                   transform_f const & transform,
+                                   datawrite_f const & write_cb)
+         {
++                tracepoint(foed, qt_create_op_fiber);
++
+                 drain_ref unmap_guard_drain_hold( unmap_svc->ref_unmap_guard_drain() );
+                 transform_target_map targets;
+ 
+@@ -5247,6 +5257,8 @@ private:
+                         uncow_lookaside.remove_key(unc);
+                 }
+ 
++                tracepoint(foed, qt_complete_op_fiber);
++
+                 return nullptr;
+         }
+ 
+diff --git a/tools/benchmark/bmark.cpp b/tools/benchmark/bmark.cpp
+index dd242dc..2c7998e 100644
+--- a/tools/benchmark/bmark.cpp
++++ b/tools/benchmark/bmark.cpp
+@@ -13,13 +13,19 @@
+ #include <osenv/tunables.h>
+ 
+ #include <segmap/segmap.h>
++#include <segmap/segio.h>
++#include <segmap/writer.h>
+ #include <svc/svc.h>
+ 
+ #include <tbl/catalog.h>
++#include <tbl/db.h>
+ #include <tbl/mutant.h>
++#include <tbl/mutant_tools.h>
+ #include <tbl/tbl.h>
+ #include <tbl/vector.h>
+ 
++#include <vol/dedup_features.h>
++#include <vol/flush_cb.h>
+ #include <vol/vol.h>
+ #include <vol/tables.h>
+ 
+@@ -354,6 +360,74 @@ struct bmark_wrapper_req :
+         }
+ };
+ 
++static atom * cbmap_source_fill = ps_atom_get("fill");
++
++struct segio_fill_req : req_blocking<>
++{
++        segio_fill_req(ps_env * env)
++        {
++        }
++
++        virtual fiber_err execute() override {
++                for (int i = 0; i < 250; i++) {
++                        std::vector<owned<buffer>> bufs;
++                        owned<buffer> buffer_ref;
++                        log_stats stats;
++                        owned<stream> buffer_stream(
++                                stream_sync_new([&]()
++                                {
++                                        buffer_ref.reset(ps_buffer_new_temporal(4096, nullptr));
++                                        bufs.push_back(owned<buffer>(buffer_ref.get()));
++                                }));
++
++                        owned<ps_old_logger> log(ps_unsorted_tuple_logger_new(
++                                buffer_stream.get(),
++                                &buffer_ref,
++                                &stats));
++
++                        tuple_ref tup;
++                        owned<stream> cbmap_stream(log->accept(schema_get<cbmap_prototype>(), &tup));
++                        owned<stream> seqinval_stream(log->accept(schema_get<seq_invalid_prototype>(), &tup));
++
++
++                        schema_pair<cbmap_prototype> mapping;
++                        for (int j = 0; j < 500; j++) {
++                                tup.key = &key_of(mapping);
++                                tup.value = &val_of(mapping);
++                                for (int k = 0; k < 250; k++) {
++                                        mapping.key.logical.volume = j;
++                                        mapping.key.logical.sector = k * 8;
++                                        mapping.key.lh_length = 7;
++                                        mapping.key.seq_upper = k;
++                                        mapping.val.cb.page.seg_id = 10;
++                                        mapping.val.cb.page.io = j;
++                                        mapping.val.cb.page.page = k;
++                                        mapping.val.cb.slot = 0;
++                                        mapping.val.sector = k * 8;
++                                        mapping.val.src_seg_id = 0;
++                                        if (!cbmap_stream->next()) {
++                                                goto full;
++                                        }
++                                }
++                                seq_invalid_prototype_key sk;
++                                sk.seq_key = name_of<cbmap_prototype>();
++                                sk.seq_lower = j;
++                                sk.seq_run = 1;
++                                tup.key = &sk;
++                                unused_value uv;
++                                tup.value = &uv;
++                                if (!seqinval_stream->next()) {
++                                        goto full;
++                                }
++                        }
++                full:
++                        d_.info("iter %% bufs %%", i, bufs.size());
++                }
++                return nullptr;
++        }
++};
++
++
+ int main(int argc, char* argv[])
+ {
+         // Create an environment.
+@@ -380,8 +454,9 @@ int main(int argc, char* argv[])
+         tests.reset(req_chain_new(true, ALLOW_DRIFT) );
+ 
+         if ( argc == 1 ) {
+-                tests->add(get_new_au_frontier_req( env.get() ) );
+-                tests->add(new bmark_wrapper_req( env.get() ) );
++                //tests->add(get_new_au_frontier_req( env.get() ) );
++                //tests->add(new bmark_wrapper_req( env.get() ) );
++                tests->add(new segio_fill_req(env.get()));
+         } else if ( argc == 2 && !strcmp(argv[1], "au") ) {
+                 tests->add( get_new_au_frontier_req( env.get() ) );
+         } else if ( argc == 2 && !strcmp(argv[1], "fl") ) {
+diff --git a/tools/premake/src/toolsets/linuxmake.lua b/tools/premake/src/toolsets/linuxmake.lua
+index d99b838..3aee19b 100644
+--- a/tools/premake/src/toolsets/linuxmake.lua
++++ b/tools/premake/src/toolsets/linuxmake.lua
+@@ -429,7 +429,7 @@ function linuxmake_writeworkspace( work )
+   p:p( "CFLAGS_COMMON = $(IFLAGS_COMMON) -D__EXTENSIONS__ -DPS_TOOLSET_GCC -fms-extensions -MMD -MP -DSCMREVISION=$(SCMREVISION) -DSCMREV=$(SCMREV) -DDRIVER_REVISION=$(DRIVER_REVISION)" )
+   p:p( "C99FLAGS_COMMON = -D_XOPEN_SOURCE=600 -std=c99" )
+   p:p( "CPPFLAGS_COMMON := -D_XOPEN_SOURCE=500 -ffor-scope $(call add-cc-option,-fno-enforce-eh-specs) -Wreorder -std=c++0x $(call disable-cc-warning,invalid-offsetof) $(call disable-cc-warning,delete-non-virtual-dtor) $(call disable-cc-warning,tautological-compare)" )
+-  p:p( "STDLIBS_COMMON := $(EXTERNAL_STDLIBS) -laio -ldl -lhwloc -lm -lpthread -lrt -lssl -lcrypto -lstdc++ -ldbus-1 -ludev -lrdmacm -libverbs -lavahi-common -lavahi-client -lcrypt -lnuma -lpam -lpam_misc -Wl,-R'$$ORIGIN/../lib'" )
++  p:p( "STDLIBS_COMMON := $(EXTERNAL_STDLIBS) -laio -ldl -lhwloc -lm -lpthread -lrt -lssl -lcrypto -lstdc++ -ldbus-1 -ludev -lrdmacm -libverbs -lavahi-common -lavahi-client -lcrypt -lnuma -lpam -lpam_misc -llttng-ust -Wl,-R'$$ORIGIN/../lib'" )
+   p:p( "CFLAGS_STATICC = $(FLAGS_COMMON) $(CFLAGS_COMMON) -DPS_BUILD_DEBUG -DPS_BUILD_ASYNC -DPS_BUILD_COVERAGE" )
+   p:p( "CFLAGS_STATICD = $(FLAGS_COMMON) $(CFLAGS_COMMON) -DPS_BUILD_DEBUG -DPS_BUILD_ASYNC" )
+   p:p( "CFLAGS_STATICR = $(FLAGS_COMMON) $(CFLAGS_COMMON) -DPS_BUILD_RELEASE" )
+diff --git a/tools/pure/tests/benchmark_tests/puretest.py b/tools/pure/tests/benchmark_tests/puretest.py
+index 043426c..e2421a0 100644
+--- a/tools/pure/tests/benchmark_tests/puretest.py
++++ b/tools/pure/tests/benchmark_tests/puretest.py
+@@ -233,8 +233,7 @@ def create_snapshots(**kwargs):
+         if this.stopped():
+             break
+ 
+-        for volume in volumes:
+-            create_snapshot(target, volume)
++        create_snapshot(target, {"name" : [v['name'] for v in volumes]})
+ 
+     purity_debug.restore()
+ 
+@@ -2222,7 +2221,7 @@ def random_write(kwargs):
+     kwargs = {
+         'testbed': testbed,
+         "volumes": volumes,
+-        'count': 4,
++        'count': 100,
+         'duration': interval * ((maxthreads - initthreads + incrthreads) / incrthreads),
+     }
+     factory.create_observer(collect_queue, kwargs)
+diff --git a/tools/workload/workparams.h b/tools/workload/workparams.h
+index 059b1dd..15e64d0 100644
+--- a/tools/workload/workparams.h
++++ b/tools/workload/workparams.h
+@@ -89,7 +89,7 @@ load_params             general_testloads[] = {
+ 	1024,	4096,	65536,	/* miniosize, stdiosize, maxiosize */
+ 	0.5,	0.20,	0.80,	/* narrow_pct, rdpct, stdpct */
+ 	0.1,	0.05,	0.2,	/* zeropct, patpct, deduppct */
+-	0.01,	0.0007,	0.001,	/* cawpct, xcopypct, prpct */
++	0.01,	0.10,	0.001,	/* cawpct, xcopypct, prpct */
+ 	0.05,	0.0002,		/* cpxpct, unmappct */
+ 	1,	0,		/* ngroups, seqflag */
+ },

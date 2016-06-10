@@ -1,0 +1,1772 @@
+diff --git a/kernel/include/osenv/fiber.h b/kernel/include/osenv/fiber.h
+index 97c2c57..ea31cc3 100644
+--- a/kernel/include/osenv/fiber.h
++++ b/kernel/include/osenv/fiber.h
+@@ -221,8 +221,13 @@ namespace osenv {
+          */
+         struct fiber : protected os_fiber {
+         public:
+-                fiber() : notify_func_(nullptr), num_context_switches_(0), running_(false),
+-                          fiber_id_(fiber_id_counter_++){ }
++                fiber()
++                        : notify_func_(nullptr)
++                        , num_context_switches_(0)
++                        , running_(false)
++                        , fiber_id_(0)
++                        , fiber_op_(0)
++                { }
+ 
+                 ~fiber() {
+                         PS_ASSERT(!notify_func_);
+@@ -273,8 +278,25 @@ namespace osenv {
+                         }
+                 }
+ 
+-                static uint32_t fiber_id() {
+-                        return current_fiber->fiber_id_;
++                static uint64_t fiber_id() {
++                        return current_fiber ? current_fiber->fiber_id_ : 0;
++                }
++
++                static uint64_t fiber_op() {
++                        return current_fiber ? current_fiber->fiber_op_ : 0;
++                }
++
++                static void set_fiber_id(uint64_t id) {
++                        current_fiber->fiber_id_ = id;
++                }
++
++                static void set_fiber_op(uint64_t op) {
++                        current_fiber->fiber_op_ = op;
++                }
++
++                static void generate_fiber_id() {
++                        current_fiber->fiber_id_ = 11 + (fiber_id_counter_++) * 16;
++                        current_fiber->fiber_op_ = 0;
+                 }
+ 
+                 // Helper function for asynchronous callers of the fiber.  Runs the fiber until it
+@@ -369,7 +391,8 @@ namespace osenv {
+                 void *                  notify_param_;
+                 uint32_t                num_context_switches_;
+                 bool                    running_;
+-                uint32_t                fiber_id_;
++                uint64_t                fiber_id_;
++                uint64_t                fiber_op_;
+                 static std::atomic<uint32_t> fiber_id_counter_;
+ 
+         private:
+diff --git a/kernel/include/osenv/tracepoints.h b/kernel/include/osenv/tracepoints.h
+index 97da6be..a437c9e 100644
+--- a/kernel/include/osenv/tracepoints.h
++++ b/kernel/include/osenv/tracepoints.h
+@@ -4,6 +4,46 @@
+ #undef TRACEPOINT_INCLUDE
+ #define TRACEPOINT_INCLUDE "osenv/tracepoints.h"
+ 
++#ifndef _TP_H
++
++inline constexpr int64_t lttngstr_lookup(char ch)
++{
++        return    (ch >= 'a' && ch <= 'z') ? ch - 'a' +  0
++                : (ch >= 'A' && ch <= 'Z') ? ch - 'A' + 26
++                : (ch >= '0' && ch <= '9') ? ch - '0' + 52
++                : -1;
++}
++
++inline constexpr uint64_t lttngstr(char const * str, uint64_t first_chars = 0, int len = 0)
++{
++        return !*str
++                ? (first_chars << 4) + len
++                : !(1000 / (len - 10))  // Force crash if length exceeds 10 chars
++                ? 0
++                : !(1000 / (lttngstr_lookup(*str) + 1)) // Force crash on invalid char
++                ? 0
++                :lttngstr(str + 1,
++                           first_chars + (lttngstr_lookup(*str) << len * 6),
++                           len + 1);
++}
++
++template<uint64_t val>
++struct tp_constval {
++        static constexpr uint64_t x = val;
++};
++
++inline uint64_t traceop_from(ps_notify_param const & cb)
++{
++        // Extremely weak hash for the function pointer, but we just don't care as much about that.
++        uint64_t p = reinterpret_cast<uint64_t>(cb.func);
++        return reinterpret_cast<uint64_t>(cb.param)
++                | (p * 922337207833ull & 0xffff000000000000ull); // Some large prime
++}
++
++#define lttngconststr(__str) (tp_constval<lttngstr(__str)>::x)
++
++#endif
++
+ #if !defined(_TP_H) || defined(TRACEPOINT_HEADER_MULTI_READ)
+ #define _TP_H
+ 
+@@ -12,45 +52,76 @@
+ TRACEPOINT_EVENT(
+         foed,
+         fiber_switch,
+-        TP_ARGS(uint32_t, old_fiber,
+-                uint32_t, new_fiber),
++        TP_ARGS(uint64_t, old_fiber,
++                uint64_t, new_fiber),
+         TP_FIELDS(
+-                ctf_integer(uint32_t, old_fiber, old_fiber)
+-                ctf_integer(uint32_t, new_fiber, new_fiber)))
++                ctf_integer(uint64_t, old_fiber, old_fiber)
++                ctf_integer(uint64_t, new_fiber, new_fiber)))
+ 
+ TRACEPOINT_EVENT(
+         foed,
+         qt_create_op_fiber,
+-        TP_ARGS(),
++        TP_ARGS(uint64_t, optype),
+         TP_FIELDS(
+-                ctf_integer(uint32_t, fiber, fiber::fiber_id())))
++                ctf_integer(uint64_t, fiber, fiber::fiber_id())
++                ctf_integer(uint64_t, optype, optype)))
+ 
+ TRACEPOINT_EVENT(
+         foed,
+         qt_complete_op_fiber,
+         TP_ARGS(),
+         TP_FIELDS(
+-                ctf_integer(uint32_t, fiber, fiber::fiber_id())))
++                ctf_integer(uint64_t, fiber, fiber::fiber_id())))
+ 
+ TRACEPOINT_EVENT(
+         foed,
+-        qt_enqueue_subop_fiber,
+-        TP_ARGS(uint64_t, sub_q,
+-                uint64_t, sub_id),
++        qt_enqueue_subop,
++        TP_ARGS(uint64_t, fiber_q,
++                uint64_t, fiber_op,
++                uint64_t, sub_q,
++                uint64_t, sub_op),
+         TP_FIELDS(
+-                ctf_integer(uint32_t, fiber, fiber::fiber_id())
++                ctf_integer(uint64_t, fiber_q, fiber_q)
++                ctf_integer(uint64_t, fiber_op, fiber_op)
+                 ctf_integer(uint64_t, sub_q, sub_q)
+-                ctf_integer(uint64_t, sub_id, sub_id)))
++                ctf_integer(uint64_t, sub_op, sub_op)))
++
++TRACEPOINT_EVENT(
++        foed,
++        qt_receive_op,
++        TP_ARGS(uint64_t, q,
++                uint64_t, op),
++        TP_FIELDS(
++                ctf_integer(uint64_t, fiber_q, q)
++                ctf_integer(uint64_t, fiber_op, op)))
+ 
+ TRACEPOINT_EVENT(
+         foed,
+         qt_wait_subop_fiber,
+         TP_ARGS(uint64_t, sub_q,
+-                uint64_t, sub_id),
++                uint64_t, sub_op),
+         TP_FIELDS(
+-                ctf_integer(uint32_t, fiber, fiber::fiber_id())
++                ctf_integer(uint64_t, fiber_q, fiber::fiber_id())
++                ctf_integer(uint64_t, fiber_op, fiber::fiber_op())
+                 ctf_integer(uint64_t, sub_q, sub_q)
+-                ctf_integer(uint64_t, sub_id, sub_id)))
++                ctf_integer(uint64_t, sub_op, sub_op)))
++
++TRACEPOINT_EVENT(
++        foed,
++        qt_milestone,
++        TP_ARGS(uint64_t, fiber_q,
++                uint64_t, fiber_op,
++                uint64_t, milestone),
++        TP_FIELDS(
++                ctf_integer(uint64_t, fiber_q, fiber_q)
++                ctf_integer(uint64_t, fiber_op, fiber_op)
++                ctf_integer(uint64_t, milestone, milestone)))
++
++#define qt_milestone_fiber(milestone) \
++        tracepoint(foed, qt_milestone, fiber::fiber_id(), fiber::fiber_op(), milestone)
++
++#define qt_enqueue_subop_fiber(sub_q, sub_op) \
++        tracepoint(foed, qt_enqueue_subop, fiber::fiber_id(), fiber::fiber_op(), sub_q, sub_op)
+ 
+ 
+ #endif /* _TP_H */
+diff --git a/kernel/osenv/unix/fiber.cpp b/kernel/osenv/unix/fiber.cpp
+index a258021..0e7c047 100644
+--- a/kernel/osenv/unix/fiber.cpp
++++ b/kernel/osenv/unix/fiber.cpp
+@@ -157,15 +157,14 @@ int pthread_mutex_unlock(pthread_mutex_t * mut)
+ 
+ };
+ 
+-// 28 stacks per thread, 96 threads, plus 1000 shared stacks = 28 * 96 + 1000 = 3688 stacks
+-// 3688 stacks @ 32kB each = max 118MB wasted.
+-// Having a batch size of 14 means object_batch fits evenly in 128 bytes.
++// 16 stacks per thread, 96 threads, plus 4096 shared stacks = 16 * 96 + 4096 = 5632 stacks
++// 5632 stacks @ 48kB each = max 270MB wasted.
+ #ifdef PS_BUILD_DEBUG
+ static thread_object_pool<fiber_stack, &fiber_stack::next_elem, &fiber_stack::next_batch,
+                           12, 500> stack_cache;
+ #else
+ static thread_object_pool<fiber_stack, &fiber_stack::next_elem, &fiber_stack::next_batch,
+-                          28, 1000> stack_cache;
++                          16, 4096> stack_cache;
+ #endif
+ 
+ fiber_stack * os_fiber::alloc_stack() {
+diff --git a/kernel/segmap/nvram_ingest.cpp b/kernel/segmap/nvram_ingest.cpp
+index cb8e55c..b8f6283 100644
+--- a/kernel/segmap/nvram_ingest.cpp
++++ b/kernel/segmap/nvram_ingest.cpp
+@@ -132,6 +132,8 @@ struct silo_ingest_impl
+         double volatile const * const   ref_alloc_throttle;
+         uint16_t const                  silo_id;
+         nvram_silo_dispatch *           dispatch;
++        uint64_t                        traceq;
++        uint64_t                        traceop;
+ 
+ 
+         // For pushing messages into the dispatch queue
+@@ -226,6 +228,11 @@ struct silo_ingest_impl
+                 opts(opts_),
+                 sfc(sfc_)
+         {
++                {
++                        char traceq_name[128];
++                        sprintf(traceq_name, "Nvram%02dIng", silo_id);
++                        traceq = lttngstr(traceq_name);
++                }
+                 seqrange->bind_pending(&bound_pending);
+                 bound_alloc_addr.silo_id = silo_id;
+ 
+@@ -438,6 +445,8 @@ struct silo_ingest_impl
+ 
+                         silo_post_msg & post_msg = *bound_post.get();
+ 
++                        traceop = traceop_from(post_msg.accept_notify);
++
+                         // We just got kicked
+                         if ( kick_msg::is_kick( &post_msg ) ) {
+                                 bound_post.detach()->accept_notify.fire();
+@@ -465,6 +474,8 @@ struct silo_ingest_impl
+                         bound_dispatch.extent.silo_id = silo_id;
+                         bound_dispatch.sync = 0U;
+ 
++                        tracepoint(foed, qt_receive_op, traceq, msg_seq_end);
++
+                         d_.debug( "[%%] msg_stat ingest (%%,%%)", silo_id,
+                                   msg_seq_begin, msg_seq_end);
+ 
+@@ -498,6 +509,8 @@ struct silo_ingest_impl
+                 msg_seq_begin = msg_seq_staged = msg_seq_end;
+                 msg_seq_end = next_align;
+ 
++                tracepoint(foed, qt_milestone, traceq, msg_seq_end, lttngconststr("Filler"));
++
+                 filler * f = create_filler( static_cast<uint32_t>(msg_seq_end - msg_seq_begin),
+                         filler_msg, filler_msg_type );
+ 
+@@ -1704,6 +1717,7 @@ silo_ingest_impl::post_msg(
+         }
+ 
+         new_->parent = this;
++        new_->traceq = traceq;
+ 
+         return new_;
+ }
+diff --git a/kernel/segmap/nvram_io.cpp b/kernel/segmap/nvram_io.cpp
+index 40e0ef4..6faeb99 100644
+--- a/kernel/segmap/nvram_io.cpp
++++ b/kernel/segmap/nvram_io.cpp
+@@ -820,6 +820,8 @@ post_msg_req::start( ps_notify_f notify_func, void * notify_param )
+ {
+         msg.accept_notify.arm(notify_func, notify_param);
+ 
++        qt_enqueue_subop_fiber(traceq, traceop_from(msg.accept_notify));
++
+         // WARNING: This must reserve a place in the queue for this message so that no later
+         // message can jump in front.
+         parent->post(&msg);
+diff --git a/kernel/segmap/nvram_persist.cpp b/kernel/segmap/nvram_persist.cpp
+index 54799a3..5a5a4c1 100644
+--- a/kernel/segmap/nvram_persist.cpp
++++ b/kernel/segmap/nvram_persist.cpp
+@@ -16,6 +16,7 @@
+ #include <foe/aes_hash.h>
+ 
+ #include <array>
++#include <string.h>
+ 
+ using namespace defs;
+ using namespace osenv;
+@@ -106,6 +107,9 @@ struct persist_mote :
+ 
+         nvram_align_callback *  align_callback;
+ 
++        atom * my_mote_id;
++        uint64_t const lttng_io_begin, lttng_io_end, lttng_traceq;
++
+         persist_mote(nvram_persist_impl & parent_, mote_mapping & mapping_, mote_update * bound_,
+                 buffer ** bound_aperture, osenv::stream * bound_stream_,
+                 uint64_t * committed_seq_, ps_notify_param mote_done,
+@@ -149,6 +153,35 @@ struct persist_mote :
+ 
+         // A specific sink so we can clean up the header_io we used.
+         void notify_verify_header(ps_err * e);
++
++        uint64_t gen_lttng_traceq() const
++        {
++                char traceq_name[128];
++                sprintf(traceq_name, "Nvram%02dIng", mapping.silo.silo_id);
++                return lttngstr(traceq_name);
++        }
++
++        uint64_t motestr(char const * prefix) const
++        {
++                char traceq_name[128];
++                int len = strlen(my_mote_id->str);
++                char const * suffix = my_mote_id->str;
++                int target = 10;
++                traceq_name[target] = 0;
++                while (--len >= 0) {
++                        if ((suffix[len] >= '0' && suffix[len] <= '9') ||
++                            (suffix[len] >= 'a' && suffix[len] <= 'z') ||
++                            (suffix[len] >= 'A' && suffix[len] <= 'Z')) {
++                                traceq_name[--target] = suffix[len];
++                                if (target < 5)
++                                        break;
++                        }
++                }
++                while (target >= 5)
++                        traceq_name[--target] = '0';
++                memcpy(traceq_name, prefix, 5);
++                return lttngstr(traceq_name);
++        }
+ };
+ 
+ struct nvram_persist_svc_impl;
+@@ -1075,8 +1108,13 @@ persist_mote::persist_mote(
+         bounds(bounds_),
+         bounds_start_index(0),
+         iolog(iolog_),
+-        align_callback(callback_)
++        align_callback(callback_),
++        my_mote_id(bdev.identify()),
++        lttng_io_begin(motestr("IOBeg")),
++        lttng_io_end(motestr("IOEnd")),
++        lttng_traceq(gen_lttng_traceq())
+ {
++        tracepoint(foed, qt_milestone, lttng_traceq, 0, motestr("NewMt"));
+         op_req.reset( bdev.get_request_shared(mote_bytes, &op, bound_aperture, ps_atom_get("persist_mote")) );
+         op_mote_header.reset( ps_buffer_wrap_new(nvram_format::apartment_sector_bytes,
+                         op.bufp, affinity_instance<inherent>() ) );
+@@ -1104,7 +1142,10 @@ persist_mote::persist_mote() :
+         dirty_sector_issued(0U),
+         unclaim_ios(0U),
+         header_io(NULL),
+-        iolog(NULL)
++        iolog(NULL),
++        lttng_io_begin(0),
++        lttng_io_end(0),
++        lttng_traceq(0)
+ {
+ }
+ 
+@@ -1357,6 +1398,7 @@ retry:
+                 }
+ 
+ 
++
+                 // We performed no update, do the starts right away
+                 next = *ref_stream_queue;
+                 *ref_stream_queue = this;
+@@ -1471,6 +1513,8 @@ persist_mote::start()
+                 dirty_sector_end);
+ #endif
+ 
++        tracepoint(foed, qt_milestone, lttng_traceq, io_sector_end, lttng_io_begin);
++
+         uint32_t bps = nvram_format::apartment_sector_bytes;
+ 
+         PS_ASSERT(!header_io);
+@@ -1602,6 +1646,8 @@ persist_mote::notify_io( ps_err * e )
+ {
+         PS_ASSERT(!next);
+ 
++        tracepoint(foed, qt_milestone, lttng_traceq, io_sector_end, lttng_io_end);
++
+         if (!!header_io) {
+                 // We should only be using a header IO when writing into sector 0
+                 PS_ASSERT(io_sector_begin == 0U);
+diff --git a/kernel/segmap/nvram_seqrange.cpp b/kernel/segmap/nvram_seqrange.cpp
+index 66d72a0..eb45fcd 100644
+--- a/kernel/segmap/nvram_seqrange.cpp
++++ b/kernel/segmap/nvram_seqrange.cpp
+@@ -33,6 +33,12 @@ struct copy_seq_state {
+         bool shutdown;
+ };
+ 
++static uint64_t lttngnvram(int silo_id)
++{
++        char traceq_name[128];
++        sprintf(traceq_name, "Nvram%02dIng", silo_id);
++        return lttngstr(traceq_name);
++}
+ 
+ // The writer stream manages a single stream for exposing buffers
+ // to the persist threads. It supports rollover to another mapping
+@@ -1902,5 +1908,3 @@ silo_seqrange_impl::~silo_seqrange_impl()
+         writer_buffer_disp.reset();
+         affinity_instance<inherent>().free(writer_buffer);
+ }
+-
+-
+diff --git a/kernel/segmap/nvram_svcs.h b/kernel/segmap/nvram_svcs.h
+index dfc4731..ae5da7e 100644
+--- a/kernel/segmap/nvram_svcs.h
++++ b/kernel/segmap/nvram_svcs.h
+@@ -906,6 +906,7 @@ struct post_msg_req :
+                 osenv::alloc_tail<size_t, osenv::temporal> >
+ {
+         ps_agent * parent;
++        uint64_t traceq;
+         silo_post_msg msg;
+ 
+         // Create an uncompressed message
+diff --git a/kernel/segmap/segio.cpp b/kernel/segmap/segio.cpp
+index 8d1dd2c..2ae807e 100644
+--- a/kernel/segmap/segio.cpp
++++ b/kernel/segmap/segio.cpp
+@@ -753,6 +753,8 @@ struct writer_segio_flush_req :
+         {
+                 // We only do this on task threads as it's CPU intensive.  Let's assert that to be the case.
+                 scheduler::assert_task(*parent->env);
++                d_.info("segio <%%:%%> run features",
++                        parent->sio_attr.addr.seg_id, parent->sio_attr.addr.io);
+ 
+                 // Get the context for segment_writer in req_start since it is guaranteed to be initialized by now
+                 segment_writer_context = context_name_to_id(name_of<ps_segment_writer>());
+@@ -787,6 +789,9 @@ struct writer_segio_flush_req :
+                 PS_ASSERT(get_current_context_id() == segment_writer_context ||
+                           get_thread_type() == ps_scheduler::PS_THR_TYPE_APP);
+ 
++                d_.info("segio <%%:%%> run hooks",
++                        parent->sio_attr.addr.seg_id, parent->sio_attr.addr.io);
++
+                 if (parent->hooks_commit.empty()) {
+                         return cont<&writer_segio_flush_req::run_joins_and_notify>();
+                 }
+@@ -811,6 +816,9 @@ struct writer_segio_flush_req :
+                 // Spawn the joins and finish
+                 parent_local->notify_joins(NULL, finalization_context);
+ 
++                d_.info("segio <%%:%%> finish",
++                        parent_local->sio_attr.addr.seg_id, parent_local->sio_attr.addr.io);
++
+                 // User callback
+                 return finish();
+         }
+diff --git a/kernel/tbl/catalog.cpp b/kernel/tbl/catalog.cpp
+index 52d80dd..95ed898 100644
+--- a/kernel/tbl/catalog.cpp
++++ b/kernel/tbl/catalog.cpp
+@@ -22,13 +22,13 @@ using namespace osenv;
+ using namespace segmap;
+ using namespace tbl;
+ 
+-static ps_diag_src d_ = { 
++static ps_diag_src d_ = {
+ 	ps_atom_get( "tbl.catalog.catalog" ),
+         // &ps_diag_log_everylevel
+ };
+ 
+ struct tbl::detail::index_cache::index_ref
+-        : index_impl<tbl::detail::index_cache::index_ref, false, index, 
++        : index_impl<tbl::detail::index_cache::index_ref, false, index,
+                 alloc_pool<tbl::detail::index_cache::index_ref> >
+ {
+         // We live in a singly linked list this should almost
+@@ -89,7 +89,7 @@ struct tbl::detail::index_cache::index_ref
+         }
+ 
+         // We don't wrap this index in a verify cursor
+-        stream * index_open(tuple_ref * ref_tuple, 
++        stream * index_open(tuple_ref * ref_tuple,
+                 ps_index_seek_pos ** ref_seek, index_dir cursor_dir)
+         {
+                 return inner->open(ref_tuple, ref_seek, cursor_dir);
+@@ -268,8 +268,8 @@ struct merge_catalog :
+         index * catalog_select(schema & s, seq_interval * seq)
+         {
+                 // Merge all non-null indexes into a collection
+-                size_t subs_used = 0;
+-                index ** subs = (index **)alloca(sizeof(index *[1]) * subcatalogs_used);
++                std::vector<index *, allocator_affinity<index *, temporal>> subs;
++                subs.reserve(subcatalogs_used);
+ 
+                 index * null_of = s.get<empty_index>();
+ 
+@@ -279,19 +279,19 @@ struct merge_catalog :
+                         if ( null_of == sub_index.get() )
+                                 continue;
+ 
+-                        subs[subs_used++] = sub_index.detach();
++                        subs.push_back(sub_index.detach());
+                 }
+ 
+-                if (!subs_used) {
++                if (subs.empty()) {
+                         // Nothing to merge afterall
+                         return null_of;
+                 }
+ 
+                 // Do some merging, either cached or uncached
+                 if (cache_cursors)
+-                        return ps_thread_cached_merged_index_new(subs_used, subs, true);
++                        return ps_thread_cached_merged_index_new(subs.size(), subs.data(), true);
+                 else
+-                        return ps_uncached_merged_index_new(subs_used, subs, true);
++                        return ps_uncached_merged_index_new(subs.size(), subs.data(), true);
+         }
+ 
+         stream * catalog_select_each(index_status * bound_ptr_index, schema & s);
+@@ -325,7 +325,7 @@ struct merge_catalog :
+                 }
+ 
+                 // Make a new merge catalog just like this one
+-                merge_catalog * 
++                merge_catalog *
+                         new_ = new(subcatalogs_used * 2U) merge_catalog(
+                         subcatalogs_used, cache_cursors, seq_priority);
+ 
+@@ -445,10 +445,10 @@ tbl::catalog_merge_new(
+ }
+ 
+ 
+-catalog_owned 
++catalog_owned
+ tbl::catalog_merge_new(
+-        size_t sources_used, 
+-        catalog_owned * sources, 
++        size_t sources_used,
++        catalog_owned * sources,
+         bool cache_cursors)
+ {
+         if (!sources_used) {
+@@ -482,8 +482,8 @@ tbl::catalog_merge_new(
+ 
+ stream *
+ tbl::stream_catalog_select_each_unique_new(
+-        index_status * bound_ptr, 
+-        catalog & select_catalog, 
++        index_status * bound_ptr,
++        catalog & select_catalog,
+         schema & select_schema )
+ {
+         bool first = true;
+@@ -573,7 +573,7 @@ ps_req_index_prime_new(
+ }
+ 
+ 
+-/* 
++/*
+  * Prime every index in a catalog by touching it once. Usually this will be synchronous.
+  */
+ 
+@@ -631,7 +631,7 @@ struct catalog_flatten_req :
+                 PS_ASSERT(!!name);
+         }
+ 
+-        // Minor cleanup - but we retain the catalog until it's 
++        // Minor cleanup - but we retain the catalog until it's
+         req_step notify_prime()
+         {
+                 prime_req.reset();      // Early dispose this request
+@@ -657,8 +657,8 @@ struct catalog_flatten_req :
+ };
+ 
+ 
+-req * 
+-tbl::catalog_req_flatten_prime( 
++req *
++tbl::catalog_req_flatten_prime(
+         catalog_owned * bound,
+         catalog & src,
+         atom * name,
+@@ -677,7 +677,7 @@ static atom * masked_schema = ps_atom_get("os76::vol::nursery_tbl_1");
+ static atom * masked_schema_cluster_peer = ps_atom_get("os76::vol::cluster_peer_2");
+ 
+ 
+-/* 
++/*
+  * Tool to dump out the contents of a catalog by schema.
+  */
+ PS_ERR_DECLARE_CONTINUE( db_err, "Database error." );
+@@ -874,7 +874,7 @@ struct cursor_caching_cursor : notify_impl<cursor_caching_cursor>
+         index_dir const         dir;
+ #endif
+ 
+-        cursor_caching_cursor(cursor_caching_index & parent, index_dir dir_c)                
++        cursor_caching_cursor(cursor_caching_index & parent, index_dir dir_c)
+ #ifdef PS_BUILD_DEBUG
+                 : dir(dir_c)
+ #endif
+@@ -964,13 +964,13 @@ struct cursor_caching_spec
+                 cursor.cursor_start();
+         }
+ 
+-        PS_FORCE_INLINE static bool cursor_next(cursor_caching_cursor & cursor, 
++        PS_FORCE_INLINE static bool cursor_next(cursor_caching_cursor & cursor,
+                 tuple_ref * bound, ps_index_seek_pos ** seek, index_dir dir)
+         {
+                 return cursor.cursor_next(bound, seek, dir);
+         }
+ 
+-        PS_FORCE_INLINE static bool cursor_next(cursor_caching_cursor & cursor, 
++        PS_FORCE_INLINE static bool cursor_next(cursor_caching_cursor & cursor,
+                 tuple_ref * bound, index_seek_bounds ** seek)
+         {
+                 return cursor.cursor_next(bound, seek);
+@@ -989,7 +989,7 @@ cursor_caching_cursor::cursor_notify(ps_err * err)
+         index_state_adapter<cursor_caching_spec>::finish_cursor(this, err);
+ }
+ 
+-struct cursor_caching_catalog 
++struct cursor_caching_catalog
+         : disposable_base<cursor_caching_catalog>
+         , catalog
+ {
+diff --git a/kernel/tbl/catalog_defaults.h b/kernel/tbl/catalog_defaults.h
+index 4a4e160..dc172ae 100644
+--- a/kernel/tbl/catalog_defaults.h
++++ b/kernel/tbl/catalog_defaults.h
+@@ -23,7 +23,7 @@ static const uint64_t PAGE_PERSIST_SEQ_THRESHOLD = 1024;
+ static const uint64_t CATALOG_MAX_LEVELS = 128;
+ 
+ // The normal number of pre-flatteners
+-static const uint64_t CATALOG_NORMAL_PREFLATTENERS = 5;
++static const uint64_t CATALOG_NORMAL_PREFLATTENERS = 30;
+ 
+ // The number of pre-flatteners at start-up
+-static const uint64_t CATALOG_START_PREFLATTENERS = 9;
+\ No newline at end of file
++static const uint64_t CATALOG_START_PREFLATTENERS = 40;
+diff --git a/kernel/tbl/catalog_log_preflatten.cpp b/kernel/tbl/catalog_log_preflatten.cpp
+index 26da564..124946e 100644
+--- a/kernel/tbl/catalog_log_preflatten.cpp
++++ b/kernel/tbl/catalog_log_preflatten.cpp
+@@ -23,6 +23,56 @@ static ps_diag_src d_ = {
+         ps_atom_get( "tbl.catalog.log.preflatten" )
+ };
+ 
++struct stream_decoupler : stream_impl<stream_decoupler>
++{
++        owned<stream> input_stream;
++
++        enum {
++                WAIT_NONE,
++                WAIT_INPUT,
++                WAIT_BOTH
++        };
++        std::atomic<unsigned> wait_mode;
++
++        explicit stream_decoupler(stream * input_stream_)
++                : input_stream(input_stream_)
++                , wait_mode(WAIT_NONE)
++        {
++        }
++
++        void start()
++        {
++                unsigned expected = WAIT_INPUT;
++                if (!wait_mode.compare_exchange_strong(expected, WAIT_BOTH)) {
++                        PS_ASSERT(expected == WAIT_NONE);
++                        finish();
++                }
++        }
++
++        bool next()
++        {
++                if (wait_mode == WAIT_INPUT) {
++                        // Racing here is ok, start() will handle it.
++                        return false;
++                }
++                PS_ASSERT(wait_mode == WAIT_NONE);
++                if (input_stream->next()) {
++                        return true;
++                }
++                wait_mode = WAIT_INPUT;
++                input_stream->start(to_notify<&stream_decoupler::input_finished>());
++                return false;
++        }
++
++        void input_finished(ps_err * e)
++        {
++                unsigned old_mode = wait_mode.exchange(WAIT_NONE);
++                PS_ASSERT(old_mode != WAIT_NONE);
++                if (old_mode == WAIT_BOTH) {
++                        finish();
++                }
++        }
++};
+ 
+ struct preflatten_listen_stream_impl :
+         stream_impl<preflatten_listen_stream_impl, alloc_static<>, preflatten_listen_stream>,
+@@ -134,6 +184,7 @@ struct preflatten_listen_stream_impl :
+ 
+         // Outgoing post-flattened operations
+         struct staged :
++                task_impl<staged>,
+                 notify_impl<staged>,
+                 alloc_static<>
+         {
+@@ -150,8 +201,12 @@ struct preflatten_listen_stream_impl :
+ 
+                 owned<> sentinel_ref;        // I keep the sentinel alive
+ 
++                ps_nsec_t started;
++
+                 schema_set const * update_schemas;
+ 
++                segmap::seq_interval const my_seq;
++
+                 staged( preflatten_listen_stream_impl & parent_,
+                                 unsigned sync_, catalog_status const & status_,
+                                 size_t indexes_used, index ** indexes ) :
+@@ -161,7 +216,8 @@ struct preflatten_listen_stream_impl :
+                                 indexes_used, indexes, parent->edition) ),
+                         fix_req( ps_catalog_fix_new(
+                                 &fix_catalog, inner, parent->alloc_name, parent->edition) ),
+-                        update_schemas( schema_set_get(indexes_used, indexes) )
++                        update_schemas( schema_set_get(indexes_used, indexes) ),
++                        my_seq(status_.seq)
+                 {
+                 }
+ 
+@@ -192,6 +248,11 @@ struct preflatten_listen_stream_impl :
+                                 if (should_wake) {
+                                         local_parent->user_sleeping = false;
+                                 }
++
++                                d_.info("[%%,%%] Stage finished %%, took %% ms, should_wake=%%",
++                                        local_parent->service_name, local_parent->edition,
++                                        my_seq, (ps_gethrtime() - started) / PS_NSEC_PER_MSEC,
++                                        should_wake);
+                         }
+ 
+                         if (should_wake) {
+@@ -224,6 +285,14 @@ struct preflatten_listen_stream_impl :
+                         }
+                 }
+ 
++                void task_exec()
++                {
++                        d_.info("[%%,%%] Fixing %%",
++                                parent->service_name, parent->edition, my_seq);
++                        started = ps_gethrtime();
++                        fix_req->start(to_notify<&staged::notify_fix>());
++                }
++
+                 void kick()
+                 {
+                         sentinel_ref.reset( parent->sentinel->external_reference(name_of<staged>(), this) );
+@@ -239,7 +308,10 @@ struct preflatten_listen_stream_impl :
+ 
+                                 PS_ASSERT(!parent->user_sleeping);
+                         } else {
+-                                fix_req->start( to_notify<&staged::notify_fix>() );
++                                d_.info("[%%,%%] Kicking %%",
++                                        parent->service_name, parent->edition, my_seq);
++                                scheduler::current().spawn(
++                                        *this, scheduler::current().default_params());
+                         }
+                 }
+         };
+@@ -270,11 +342,11 @@ struct preflatten_listen_stream_impl :
+                         patch_preflatten_params const & params_,
+                         patch & src_,
+                         seq_start const & opt_src_seq_ ) :
+-                patch_preflatten_params(params_),                
++                patch_preflatten_params(params_),
+                 edition(edition_),
+                 alloc_name( ps_atom_concat("asa", d_.name, ":", service_name) ),
+                 bound(bound_),
+-                inner_stream( src_.listen(&inner, opt_src_seq_) ),
++                inner_stream(new stream_decoupler(src_.listen(&inner, opt_src_seq_))),
+                 inner_end(false),
+                 bypasses_lock( monitor_new() ),
+                 flattened_seq_set(!opt_src_seq_.current),
+@@ -540,6 +612,8 @@ struct preflatten_listen_stream_impl :
+ 
+                         // Pull in this update
+                         admitted.push_back( update::clone(inner) );
++                        d_.info("[%%,%%] Admit seq %%", service_name, edition,
++                                admitted.back()->status.seq.lower_);
+ 
+ #ifdef PS_BUILD_DEBUG
+                         // Either patch seq moves forward or this is an empty sync patch update
+@@ -658,9 +732,11 @@ struct preflatten_listen_stream_impl :
+ 		PS_ASSERT(flatteners_max > 0U);
+ 
+                 while ( has_flattener_capacity(flatteners_max) ) {
++                        d_.info("[%%,%%] Run another flattener", service_name, edition);
+                         // There aren't enough flatteners running right now
+                         auto i_end_flatten = try_accept(level_pages);
+                         if (i_end_flatten == admitted.begin() || inner_end) {
++                                d_.info("[%%,%%] Nothing else to flatten", service_name, edition);
+                                 break;
+                         }
+ 
+@@ -703,8 +779,12 @@ struct preflatten_listen_stream_impl :
+                                 bool flatten_required = false;
+                                 auto i_begin_bypass = next_bypass(&flatten_required, flatten_status.seq.upper_);
+ 
+-                                for (auto i_bypass = i_begin_bypass; i_bypass != bypasses.end(); ++i_bypass) {
++                                if (i_begin_bypass != bypasses.end()) {
++                                        d_.info("[%%,%%] incorporate bypass for %%",
++                                                service_name, edition, flatten_status.seq);
++                                }
+ 
++                                for (auto i_bypass = i_begin_bypass; i_bypass != bypasses.end(); ++i_bypass) {
+                                         // Should never find bypass indexes in a gap range.
+                                         PS_ASSERT( !(flatten_sync & SYNC_GAP) );
+ 
+@@ -745,6 +825,10 @@ struct preflatten_listen_stream_impl :
+                         new_->kick();
+                 }
+ 
++                if (!has_flattener_capacity(flatteners_max)) {
++                        d_.info("[%%,%%] No more flattener capacity", service_name, edition);
++                }
++
+                 if (inner_end) {
+                         // Short circuit because we read the end of stream
+                         finish();
+@@ -763,12 +847,16 @@ struct preflatten_listen_stream_impl :
+                                         // We can immediately wake
+                                         l_.reset();
+ 
++                                        d_.info("[%%,%%] Flatten ready", service_name, edition);
+                                         finish();
+                                         return;
+                                 }
+ 
+                                 // If we get here we're waiting on a flatten, so do that before drawing
+                                 // more from the source
++                                d_.info("[%%,%%] Waiting on flatten (%% flatteners, seq %%)",
++                                        service_name, edition, flattened.size(),
++                                        flattened.front()->my_seq);
+                                 user_sleeping = true;
+                                 return;
+                         }
+@@ -776,6 +864,7 @@ struct preflatten_listen_stream_impl :
+ 
+                 // If we get here, we must be waiting on the inner stream, we don't mark user-sleeping
+                 // as true because there are no live flattens at the moment
++                d_.info("[%%,%%] Waiting on more input", service_name, edition);
+                 call_finish(*inner_stream);
+         }
+ 
+@@ -798,6 +887,7 @@ struct preflatten_listen_stream_impl :
+                 if ( !flattened.empty() ) {
+                         // When it's not empty, we'll decide this pretty quickly
+                         if (!!flattened.front()->fix_req) {
++                                d_.info("[%%,%%] Next, still fixing", service_name, edition);
+                                 return false;
+                         }
+ 
+diff --git a/kernel/tbl/catalog_persist.cpp b/kernel/tbl/catalog_persist.cpp
+index c64f9e9..d0cd8b4 100644
+--- a/kernel/tbl/catalog_persist.cpp
++++ b/kernel/tbl/catalog_persist.cpp
+@@ -370,7 +370,7 @@ struct persist_listen_stream :
+                         seq_primary = !!(parent.patches_sync & SYNC_PRIMARY);
+                 }
+ 
+-                // Clone the levels from the request sequence number (seq_.seq) to 
++                // Clone the levels from the request sequence number (seq_.seq) to
+                 // the serial number the parent patches start at. Fill in the gap.
+                 if (!first_seq_.current && first_seq_.seq < seq) {
+                         init_catalog = parent.log_catalog.clone_part(seq_interval(first_seq_.seq, seq));
+@@ -726,6 +726,8 @@ persist_patch_index_post(
+                                 // Queue this update at the head of all patch updates
+                                 update.serial = this_->serial;
+                                 update.refs   = this_->streams;
++                                d_.info("[%%] incorporate serial:patch %%:%%",
++                                        this_->log_catalog_name, update.serial, update.status.seq);
+                                 this_->patches[update.serial] = std::move(update);
+ 
+                                 // Finally see if there's anyone to wake
+diff --git a/kernel/tbl/patch_log.cpp b/kernel/tbl/patch_log.cpp
+index 739a568..5798339 100644
+--- a/kernel/tbl/patch_log.cpp
++++ b/kernel/tbl/patch_log.cpp
+@@ -397,16 +397,20 @@ struct log_listen_stream :
+                                 started = false;
+                         }
+ 
++                        d_.info("patch %% received %%:%% started %%",
++                                (uintptr_t)this,
++                                seq_ref->handle.seg_id, seq_ref->handle.io, started);
+ 
+                         log_src s = {src, started};
+                         srcs.push_back(s);
+                 }
+ 
+                 if (srcs.size() >= 1U) {
+-                        d_.trace( "multiple load: %% - %% (%% total)",
++                        d_.info( "%% multiple load: %% - %% (%% total)",
++                                (uintptr_t)this,
+                                 srcs.front().log->seq, srcs.back().log->seq, srcs.size() );
+                 } else {
+-                        d_.trace("empty size");
++                        d_.info("%% empty size", (uintptr_t)this);
+                 }
+ 
+                 // Set up the first entry
+@@ -484,6 +488,9 @@ struct log_listen_stream :
+ 
+                 PS_ASSERT(reqs.size() == nreqs && seqs.size() == nreqs);
+ 
++                d_.info("%%: Initiate read of %%",
++                        (uintptr_t)this, nreqs);
++
+                 // Make an aggregate request to load the catalogs simultaneously
+                 aggr_req.reset( ps_req_many_aggr_new( nreqs, reqs.data(), errs.data() ) );
+                 call<&log_listen_stream::post_start>(*aggr_req);
+@@ -499,6 +506,8 @@ struct log_listen_stream :
+ 
+                 uint64_t                        last_seq_err = 0;
+ 
++                d_.info("%%: Reads finished", (uintptr_t)this);
++
+                 for (unsigned i = 0; i != errs.size(); ++i) {
+                         if (!errs[i]) {
+                                 continue;
+@@ -569,17 +578,19 @@ struct log_listen_stream :
+                                 return true;
+                         }
+ 
+-                        if ( pull_seqs() ) {
++                        if ( !pull_seqs() ) {
+                                 return false;
+                         }
+ 
+-                        // Otherwise we are truly idle
+-                        return false;
++                        // Yay we found more work to do.
+                 }
+ 
+                 if (!describe_stream) {
+                         PS_ASSERT( !srcs.empty() );
+                         patch_log_src * log_src = srcs.front().log;
++                        if (!srcs.front().started) {
++                                return false;
++                        }
+ 
+                         if (!log_src->catalog) {
+                                 // The request to load this catalog has not yet been executed
+diff --git a/kernel/vol/medium_next.cpp b/kernel/vol/medium_next.cpp
+index 4a2993f..a4b6f92 100644
+--- a/kernel/vol/medium_next.cpp
++++ b/kernel/vol/medium_next.cpp
+@@ -1371,6 +1371,12 @@ struct medium_debt_svc_impl :
+ 
+         // A wrapper that ferries a copyout debt through the fill machinery.
+         struct fast_emitter : stream {
++                ps_nsec_t created;
++
++                fast_emitter()
++                        : created(ps_gethrtime())
++                { }
++
+                 virtual void reset_emit() = 0;
+                 virtual void emit(emit_kit *) = 0;
+                 virtual unsigned est_tuples() const = 0;
+@@ -1853,11 +1859,14 @@ struct medium_debt_svc_impl :
+ 
+                 ps_nsec_t       started;
+ 
++                ps_nsec_t       oldest = UINT64_MAX;
++
+                 emit_kit        kit;
+ 
+                 bool            did_work = false;
+                 bool            succeeded = false;
+                 bool            any_order = false;
++                uint64_t        num_tuples = 0;
+ 
+                 // Used to ensure we emit mediums in order when possible.
+                 uint64_t        next_vol = 0;
+@@ -1871,18 +1880,15 @@ struct medium_debt_svc_impl :
+                         , kit(segio)
+                 {
+                         owned<> l(parent->fillers_lock->enter());
+-                        d_.info("Starting segio fill for %% (%% post nvram lookaside, %% post nvram fillers, %% fillers, %% pending tuples, "
++                        d_.info("Starting segio fill for %% (%% post nvram lookaside, %% post nvram fillers, %% fillers, %%k pending tuples, "
+                                 "%% concurrent fillers, %% open segios)",
+                                 any(kit.segio_h),
+                                 parent->post_nvram_lookaside.size(),
+                                 parent->post_nvram_fillers.size(),
+                                 parent->fillers.size(),
+-                                parent->fillers_tuples,
++                                parent->fillers_tuples / 1000,
+                                 parent->num_filling_segio,
+                                 parent->num_open_segio.load());
+-                        tracef("Starting segio fill for (%ld, %d) (%ld pending tuples, %d concurrent fillers, %d open segios)",
+-                               segio_h.seg_id, segio_h.io, parent->fillers_tuples, parent->num_filling_segio,
+-                               parent->num_open_segio.load());
+                         memset(buckets, 0, sizeof(buckets));
+                 }
+ 
+@@ -1905,13 +1911,17 @@ struct medium_debt_svc_impl :
+                         return !!current;
+                 }
+ 
+-                void flushed() {
++                void flushed(ps_nsec_t filled) {
++                        ps_nsec_t now = ps_gethrtime();
+                         d_.info("Segio fill for %% flushed %% copy outs (%% w/cblocks %% w/reread "
+-                                "%% anyorder) into a %% segio took %% ms",
++                                "%% anyorder %% tuples) into a %% segio took %% ms (%% fill / %% finalize) oldest %% ms",
+                                 any(kit.segio_h), completed_fillers.size(),
+                                 kit.ncblock_copyouts, kit.nreread_copyouts,
+-                                any_order, is_full() ? "full" : "partial",
+-                                (ps_gethrtime() - started) / PS_NSEC_PER_MSEC);
++                                any_order, num_tuples, is_full() ? "full" : "partial",
++                                (now - started) / PS_NSEC_PER_MSEC,
++                                (filled - started) / PS_NSEC_PER_MSEC,
++                                (now - filled) / PS_NSEC_PER_MSEC,
++                                (now - oldest) / PS_NSEC_PER_MSEC);
+                         for (fast_emitter * each : completed_fillers) {
+                                 each->flushed();
+                         }
+@@ -1979,6 +1989,9 @@ struct medium_debt_svc_impl :
+                 stream_step emit_emitter(fast_emitter * e)
+                 {
+                         if ((current = e)) {
++                                if (current->created < oldest) {
++                                        oldest = current->created;
++                                }
+                                 did_work = true;
+                                 current->emit(&kit);
+                                 return emit_tuples<next_func>();
+@@ -1997,6 +2010,7 @@ struct medium_debt_svc_impl :
+                                 current = nullptr;
+                                 return (this->*next_func)();
+                         }
++                        num_tuples++;
+                         return succeed<&segio_fill_stream::emit_tuples<next_func>>();
+                 }
+         };
+@@ -2043,15 +2057,22 @@ struct medium_debt_svc_impl :
+                                 name_of<dedup_hash_recent>(), nullptr,
+                                 &stat, space_time.get(), 0, true)));
+ 
++                        ps_nsec_t filled = ps_gethrtime();
++
+                         if (fill_stream->is_full()) {
+-                                fire();
++                                fired = true;
++                                fiber::suspend([this](fiber * f)
++                                {
++                                        medium_debt_svc_impl * p = parent; // Pull while safe
++                                        f->resume();
++                                        fire(p); // Wait until we go async to fire off the next one
++                                });
+                         }
+-
+                         // Persist.
+                         RETHROW(run_and_dispose(segio.finalize.detach()));
+ 
+                         // Now we can remove these from our lookaside.
+-                        fill_stream->flushed();
++                        fill_stream->flushed(filled);
+ 
+                         return nullptr;
+                 }
+@@ -2065,19 +2086,25 @@ struct medium_debt_svc_impl :
+                 medium_debt_svc_impl * parent;
+                 bool fired = false;
+ 
++                static void fire(medium_debt_svc_impl * p) {
++                        {
++                                owned<> l(p->fillers_lock->enter());
++                                p->num_filling_segio--;
++                        }
++                        p->segio_fill_dispatch();
++                }
++
+                 void fire() {
+                         if (!fired) {
+-                                {
+-                                        owned<> l(parent->fillers_lock->enter());
+-                                        parent->num_filling_segio--;
+-                                }
+                                 fired = true;
++                                fire(parent);
++                        } else {
++                                // We always call segio_fill_dispatch.  Either this is before
++                                // finalize, in which case we're trying to increase parallelism, or
++                                // this is in the destructor, in which case we may have flushed
++                                // debt and now have more pending work to do.
++                                parent->segio_fill_dispatch();
+                         }
+-                        // We always call segio_fill_dispatch.  Either this is before finalize, in
+-                        // which case we're trying to increase parallelism, or this is in the
+-                        // destructor, in which case we may have flushed debt and now have more
+-                        // pending work to do.
+-                        parent->segio_fill_dispatch();
+                 }
+ 
+                 static void finish_fill(void * param, ps_err * err)
+@@ -2374,7 +2401,7 @@ struct medium_debt_svc_impl :
+                 , flush_old_space_threshold_ns(tune.get<uint64_t>("FLUSH_OLD_SPACE_THRESHOLD_NS",
+                                                                   PS_NSEC_PER_MSEC))
+                 , flush_old_space_mult(tune.get<double>("FLUSH_OLD_SPACE_MULT", 1.5))
+-                , segio_fill_tuples(tune.get<uint64_t>("MEDIUM_NEXT_FILL_TUPLES", 300000))
++                , segio_fill_tuples(tune.get<uint64_t>("MEDIUM_NEXT_FILL_TUPLES", 375000))
+                 , segio_max_fill(tune.get<uint64_t>("MEDIUM_NEXT_MAX_FILL_SEGIO", 8))
+                 , fillers_lock(monitor_new())
+         {
+@@ -4107,6 +4134,9 @@ struct medium_next_svc_impl : medium_next_svc, service_impl<medium_next_svc_impl
+         virtual fiber_err create_volume(size_t vol_tuples_used, schema_pair<volumes_map> const * vol_tuples,
+                                         size_t extra_tuples_used, variant_tuple_ref const * extra_tuples) override
+         {
++                fiber::generate_fiber_id();
++                tracepoint(foed, qt_create_op_fiber, lttngconststr("CreateVol"));
++
+                 PS_ASSERT(started);
+                 PS_ASSERT(vol_tuples_used);
+                 id_set volume_ids;
+@@ -4114,7 +4144,7 @@ struct medium_next_svc_impl : medium_next_svc, service_impl<medium_next_svc_impl
+                         // Can't handle same volume;
+                         PS_ASSERT(volume_ids.find(vol_tuples[i].key.volume) == volume_ids.end());
+                         volume_ids.insert(vol_tuples[i].key.volume);
+-                 }
++                }
+ 
+                 RETHROW(transform_trees(volume_ids, vol_tuples_used, vol_tuples,
+                         extra_tuples_used, extra_tuples, false,
+@@ -4134,6 +4164,7 @@ struct medium_next_svc_impl : medium_next_svc, service_impl<medium_next_svc_impl
+                         }
+                 }));
+ 
++                tracepoint(foed, qt_complete_op_fiber);
+                 return nullptr;
+         }
+ 
+@@ -4146,6 +4177,8 @@ struct medium_next_svc_impl : medium_next_svc, service_impl<medium_next_svc_impl
+                                 size_t vol_tuples_used,   schema_pair<volumes_map> const * vol_tuples,
+                                 size_t extra_tuples_used, variant_tuple_ref const * extra_tuples) override
+         {
++                fiber::generate_fiber_id();
++                tracepoint(foed, qt_create_op_fiber, lttngconststr("XCopy"));
+                 PS_ASSERT(started);
+                 id_set volume_ids;
+                 for (size_t i = 0; i < masks_used; ++i) {
+@@ -4237,6 +4270,8 @@ struct medium_next_svc_impl : medium_next_svc, service_impl<medium_next_svc_impl
+                         }
+                 } ) );
+ 
++                tracepoint(foed, qt_complete_op_fiber);
++
+                 return nullptr;
+         }
+ 
+@@ -4281,8 +4316,10 @@ struct medium_next_svc_impl : medium_next_svc, service_impl<medium_next_svc_impl
+                                    });
+                 }
+ 
++                fiber::generate_fiber_id();
++                tracepoint(foed, qt_create_op_fiber, lttngconststr("WSame"));
+                 bdag_leaf::edge wsame_edge;
+-                return transform_trees({volume_id}, 0, nullptr, 0, nullptr, false,
++                RETHROW(transform_trees({volume_id}, 0, nullptr, 0, nullptr, false,
+                         [&](transform_log & changes, transform_target_map & targets)
+                 {
+                         PS_ASSERT(targets.size() == 1);
+@@ -4315,7 +4352,11 @@ struct medium_next_svc_impl : medium_next_svc, service_impl<medium_next_svc_impl
+                                 return nvram_writer->write_same(addr, data, MAX_EXTENT_SECTORS);
+                         }
+                         return nullptr;
+-                });
++                }));
++
++                tracepoint(foed, qt_complete_op_fiber);
++
++                return nullptr;
+         }
+ 
+         void wsame_worker(transform_log & changes, bdag_leaf::edge const & wsame_edge,
+@@ -4549,15 +4590,22 @@ struct medium_next_svc_impl : medium_next_svc, service_impl<medium_next_svc_impl
+                               bool write_op, extent_cb_f const & extent_cb,
+                               trace_f const & trace_func)
+         {
++                fiber::generate_fiber_id();
++                tracepoint(foed, qt_create_op_fiber,
++                           write_op ? lttngconststr("Write") : lttngconststr("Read"));
++
+                 PS_ASSERT(started);
+                 bool handled;
+ 
+                 RETHROW(get_extents_fast(addr.volume, addr.sector, length, write_op, handled,
+                                          extent_cb, trace_func));
+                 if (handled) {
++                        tracepoint(foed, qt_complete_op_fiber);
+                         return nullptr;
+                 }
+ 
++                qt_milestone_fiber(lttngconststr("SlowPath"));
++
+                 extent_vec_t extents;
+                 extents.reserve(4);
+                 RETHROW(transform_trees({addr.volume}, 0, nullptr, 0, nullptr, true,
+@@ -4608,6 +4656,7 @@ struct medium_next_svc_impl : medium_next_svc, service_impl<medium_next_svc_impl
+                 }
+ #endif
+ 
++                tracepoint(foed, qt_complete_op_fiber);
+                 return nullptr;
+         }
+ 
+@@ -4944,11 +4993,10 @@ private:
+                                   transform_f const & transform,
+                                   datawrite_f const & write_cb)
+         {
+-                tracepoint(foed, qt_create_op_fiber);
+-
+                 drain_ref unmap_guard_drain_hold( unmap_svc->ref_unmap_guard_drain() );
+                 transform_target_map targets;
+ 
++                qt_milestone_fiber(lttngconststr("LockTrees"));
+                 uint64_t pending_bdag_seq = 0;
+                 for (uint64_t volume_id : volume_ids) {
+                         volume_entry * vol;
+@@ -5053,6 +5101,7 @@ private:
+                 // 4. Do tree transform, populate new write tree
+                 PS_ASSERT(pending_bdag_seq != 0);
+                 transform_log changes(pending_bdag_seq, next_extent_id, next_node_id);
++                qt_milestone_fiber(lttngconststr("Transform"));
+                 transform(changes, targets);
+ 
+                 if (!changes.target_silo_mask) { // Write to silo 0 if we don't have a better one.
+@@ -5061,6 +5110,7 @@ private:
+ 
+                 std::vector<drain_ref, allocator_affinity<drain_ref>> uncow_drains;
+ 
++                qt_milestone_fiber(lttngconststr("UnlockTree"));
+                 for (auto & vols : targets) {
+                         bdag_root * new_wtree = vols.second.new_root;
+                         volume_entry * vol = vols.second.vol;
+@@ -5091,10 +5141,12 @@ private:
+                 // 7. Wait for old write_tree->write_enqueue_count to be 0. STALL duration
+                 // is limited to enqueue time, i.e. 1-10uS.
+                 if (reuse_bdag_seq) {
++                        qt_milestone_fiber(lttngconststr("WaitXcopy"));
+                         for (auto & item : targets) {
+                                 item.second.drains->xcopy_log.wait();
+                         }
+                 } else {
++                        qt_milestone_fiber(lttngconststr("WaitWrtEnq"));
+                         for (auto & item : targets) {
+                                 item.second.drains->write_enqueue.wait();
+                         }
+@@ -5102,7 +5154,9 @@ private:
+ 
+                 // 7a. Enqueue write op to nvram; get handle to completion wait req.  Must occur
+                 // before copy_deferred so that copy_deferred may use the data written here.
++                qt_milestone_fiber(lttngconststr("WriteCB"));
+                 owned<req> complete_req(write_cb());
++                qt_milestone_fiber(lttngconststr("WrtEnqUn"));
+                 for (auto item : targets) {
+                         item.second.new_drains->write_enqueue.unref();
+                 }
+@@ -5119,6 +5173,7 @@ private:
+                 // do this before enqueuing the tree tuples since they may refer directly to
+                 // extents generated here (esp for write_same).
+                 if (!!complete_req) {
++                        qt_milestone_fiber(lttngconststr("WaitCB"));
+                         auto err = complete_req->execute();
+                         if (!!err) {
+                                 // XXX RELEASE REFS
+@@ -5131,6 +5186,7 @@ private:
+                 // Should be okay to only wait for tree mod enqueueing for the first tree
+                 // because we held the lock so no other tree mod could be enqueued
+                 if (!reuse_bdag_seq) {
++                        qt_milestone_fiber(lttngconststr("DrainDance"));
+                         for (auto item : targets) {
+                                 item.second.drains->write_log.wait();
+                                 item.second.new_drains->write_log.unref();
+@@ -5138,6 +5194,7 @@ private:
+                         }
+                 }
+ 
++                qt_milestone_fiber(lttngconststr("TupleEnq"));
+                 // 10. Enqueue tree mod, volume and extra tuples
+                 variant_tuple_ref splice_tuple_parallel[nvram_listen_fixture::silos_max];
+                 owned<stream> splice_stream_parallel[nvram_listen_fixture::silos_max];
+@@ -5195,6 +5252,7 @@ private:
+ 
+                 // 11. Unref new_write_tree->tree_mod_enqueueing.
+                 if (!reuse_bdag_seq) {
++                        qt_milestone_fiber(lttngconststr("XcopyEnqUn"));
+                         for (auto item : targets) {
+                                 item.second.new_drains->xcopy_enqueue.unref();
+                         }
+@@ -5202,6 +5260,7 @@ private:
+                 uncow_drains.clear();
+ 
+                 // 12. Wait on tree log.  STALL for 400uS.
++                qt_milestone_fiber(lttngconststr("WaitNvram"));
+                 for (auto & q : queuer_parallel) {
+                         if (q.get()) {
+                                 auto err = run_and_dispose(q.detach());
+@@ -5221,6 +5280,7 @@ private:
+                         }
+                 }
+ 
++                qt_milestone_fiber(lttngconststr("PromotTree"));
+                 for (auto & item : targets) {
+                         // 13. Free old prev_write_tree
+                         bdag_root * new_wtree = item.second.new_root;
+@@ -6423,18 +6483,22 @@ private:
+ 
+                 {
+                         // 2. Enqueue write to log (enqueue data write to medium X in silo(hash(X)))
++                        qt_milestone_fiber(lttngconststr("Callback"));
+                         owned<req_cluster> cluster(req_cluster_new(true, ALLOW_DRIFT));
+                         auto err = extent_cb(extents, &cluster);
+ 
+                         // 3. Unref write_enqueue_count
++                        qt_milestone_fiber(lttngconststr("EnqUnref"));
+                         enqueue.reset();
+ 
+                         // 4. Wait on log to complete
+                         if (!err) {
++                                qt_milestone_fiber(lttngconststr("WaitWrite"));
+                                 err = cluster->execute();
+                         }
+ 
+                         // 5. Unref write_completion_count
++                        qt_milestone_fiber(lttngconststr("ComplUnref"));
+                         completion.reset();
+ 
+                         // 6. Wait on prev_write_tree->write_completion_count to complete
+@@ -6446,9 +6510,12 @@ private:
+ 
+                                 // Drains is still usable since we just cleared the completion
+                                 // above.
++                                qt_milestone_fiber(lttngconststr("WaitTree"));
+                                 drains->xcopy_log.wait();
+                         }
+ 
++                        tracepoint(foed, qt_complete_op_fiber);
++
+                         return err;
+                 }
+         }
+diff --git a/tools/lttng/qanalyze b/tools/lttng/qanalyze
+index c221e7a..cf4857d 100755
+--- a/tools/lttng/qanalyze
++++ b/tools/lttng/qanalyze
+@@ -1,4 +1,5 @@
+ #!/usr/bin/python3
++# -*- mode: Python -*-
+ 
+ import babeltrace
+ import bisect
+@@ -9,19 +10,8 @@ import time
+ from tkinter import *
+ from tkinter import ttk
+ 
+-lastx, lasty = 0, 0
+-
+ NS_PER_MS = 1000 * 1000.
+ 
+-def xy(event):
+-    global lastx, lasty
+-    lastx, lasty = event.x, event.y
+-
+-def addLine(canvas, event):
+-    global lastx, lasty
+-    canvas.create_line((lastx, lasty, event.x, event.y))
+-    lastx, lasty = event.x, event.y
+-
+ class LinearScale:
+     def __init__(self, base, mult):
+         self.base = base
+@@ -30,6 +20,9 @@ class LinearScale:
+     def get(self, val):
+         return int((val - self.base) * self.mult)
+ 
++    def reverse(self, pix):
++        return pix / self.mult + self.base
++
+     def anchor_zoom(self, point, mult):
+         # (anchor - self.base) * self.mult = point
+         # (anchor - new.base) * self.mult * mult = point
+@@ -44,23 +37,35 @@ class LinearScale:
+ 
+ class BaseOps:
+     def __init__(self, trace):
+-        self.ops = []
+-        self.fibers = [] # (fiber, time, thread, in?)
++        self.ops = [] # (finish, duration, fiberq, optype)
++        self.fibers = [] # (fiberq, time, thread, what) (pos # - op, -1: in, -2: out)
++                         # if op: subsequent # is: -1: receive, or positive #: milestone
++                         #                     or -2: enqueue (followed by sub_q, sub_op)
+         open_ops = {}
+         start = time.time()
+         count = 0
+         for event in trace.events:
+-            if event.name == 'foed:qt_create_op_fiber':
+-                open_ops[event['fiber']] = event.timestamp
+-            if event.name == 'foed:qt_complete_op_fiber':
++            ename = event.name
++            if ename == 'foed:fiber_switch':
++                vtid = event['vtid']
++                self.fibers.append((event['old_fiber'], event.timestamp, vtid, -2))
++                self.fibers.append((event['new_fiber'], event.timestamp, vtid, -1))
++            elif ename == 'foed:qt_milestone':
++                self.fibers.append((event['fiber_q'], event.timestamp, event['vtid'], event['fiber_op'], event['milestone']))
++            elif ename == 'foed:qt_receive_op':
++                self.fibers.append((event['fiber_q'], event.timestamp, event['vtid'], event['fiber_op'], -1))
++            elif ename == 'foed:qt_enqueue_subop':
++                self.fibers.append((event['fiber_q'], event.timestamp, event['vtid'],
++                                    event['fiber_op'], -2, event['sub_q'], event['sub_op']))
++            elif ename == 'foed:qt_create_op_fiber':
++                open_ops[event['fiber']] = (event.timestamp, event['optype'])
++            elif ename == 'foed:qt_complete_op_fiber':
+                 if event['fiber'] in open_ops:
+                     self.ops.append((event.timestamp, 
+-                                     event.timestamp - open_ops[event['fiber']],
+-                                     event['fiber']))
++                                     event.timestamp - open_ops[event['fiber']][0],
++                                     event['fiber'],
++                                     open_ops[event['fiber']][1]))
+                     del open_ops[event['fiber']]
+-            if event.name == 'foed:fiber_switch':
+-                self.fibers.append((event['old_fiber'], event.timestamp, event['vtid'], False))
+-                self.fibers.append((event['new_fiber'], event.timestamp, event['vtid'], True))
+             count += 1
+             if not (count & 131071):
+                 print("..%d" % count)
+@@ -73,21 +78,53 @@ class BaseOps:
+         oplist_sel = [self.listops[x] for x in self.oplist.curselection()]
+         self.oplist.delete(0, END)
+         self.canvas.delete(ALL)
++
++        high_lat = 0
++        for op in self.ops:
++            x = self.time_scale.get(op[0])
++            if x >= 0 and x < 1500 and op[1] > high_lat:
++                high_lat = op[1]
++        self.latency_scale = LinearScale(high_lat, -200. / high_lat)
++
+         self.canvas.create_line(
+-            (0, self.latency_scale.get(1000000),
+-             1500, self.latency_scale.get(1000000)))
++            (   0, self.latency_scale.get(NS_PER_MS),
++             1500, self.latency_scale.get(NS_PER_MS)))
+         listops = []
++        oplatency = []
+         for op in self.ops:
+             x = self.time_scale.get(op[0])
+-            if x >= 0 and x < 1500 and self.time_scale.get(op[0] - op[1]) >= 0:
+-                self.oplist.insert(END, 'Op finished at %.4f took %.4fms (started at %.4f)' %
+-                                   ((op[0] - self.ops[0][0]) / NS_PER_MS,
+-                                    op[1] / NS_PER_MS,
+-                                    (op[0] - self.ops[0][0] - op[1]) / NS_PER_MS))
+-                listops.append(op)
+-            self.canvas.create_rectangle(
+-                (x - 1, self.latency_scale.get(op[1]) - 1,
+-                 x + 1, self.latency_scale.get(op[1]) + 1))
++            if x >= 0 and x < 1500:
++                color = 'darkgrey'
++                if self.time_scale.get(op[0] - op[1]) >= 0:
++                    self.oplist.insert(END, 'Op %s finished at %.4f took %.4fms (started at %.4f)' %
++                                       (self.milestone_to_txt(op[3]),
++                                        (op[0] - self.ops[0][0]) / NS_PER_MS,
++                                        op[1] / NS_PER_MS,
++                                        (op[0] - self.ops[0][0] - op[1]) / NS_PER_MS))
++                    listops.append(op)
++                    oplatency.append(op[1])
++                    color = 'black'
++                self.canvas.create_rectangle(
++                    (x - 1, self.latency_scale.get(op[1]) - 1,
++                     x + 1, self.latency_scale.get(op[1]) + 1),
++                    outline = color)
++
++        oplatency.sort()
++        runningsum = 0
++        lastavg = 0
++        lastpt = 0
++        for i in range(len(oplatency)):
++            runningsum += oplatency[i]
++            self.canvas.create_line(
++                (i * 1500 / len(oplatency), self.latency_scale.get(lastpt),
++                 (i + 1) * 1500 / len(oplatency), self.latency_scale.get(oplatency[i])),
++                fill = 'red')
++            lastpt = oplatency[i]
++            self.canvas.create_line(
++                (i * 1500 / len(oplatency), self.latency_scale.get(lastavg),
++                 (i + 1) * 1500 / len(oplatency), self.latency_scale.get(runningsum / (i + 1.))),
++                fill = 'blue')
++            lastavg = runningsum / (i + 1.)
+ 
+         self.listops = listops
+         for x in oplist_sel:
+@@ -113,6 +150,21 @@ class BaseOps:
+ 
+         self.rerender_op()
+ 
++    def milestone_to_txt(self, mile):
++        if (mile & 15) == 11:
++            return "%d" % (mile >> 4)
++        mmap = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
++        return ''.join([mmap[(mile >> (i * 6 + 4)) & 63] for i in range(mile & 15)])
++
++    def txt_to_milestone(self, txt):
++        mmap = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
++        idxs = [mmap.find(x) for x in txt]
++        idxs.reverse()
++        ret = 0
++        for i in idxs:
++            ret = (ret << 6) | i
++        return (ret << 4) | len(idxs)
++
+     def rerender_op(self):
+         self.workchart.delete(ALL)
+ 
+@@ -123,20 +175,74 @@ class BaseOps:
+         op = self.listops[sel[0]]
+ 
+         now = op[0] - op[1]
+-        idx = bisect.bisect(self.fibers, (op[2], now, 0, False))
+-        while now < op[0]:
+-            assert not self.fibers[idx][3]
+-            nxt = min(self.fibers[idx][1], op[0])
++
++        queues = set([op[2]])
++        displayed_queues = set()
++        y = 0
++        while len(queues) != len(displayed_queues):
++            q = min(queues - displayed_queues)
++            displayed_queues.add(q)
++            if True or len(queues) == 1:
++                qref, y = self.render_q(q, y, now, op[0])
++            else:
++                qref, y = self.render_q(q, y, self.time_scale.reverse(0), op[0])
++            queues |= qref
++
++    def render_q(self, fiberq, y, start_time, end_time):
++        qref = set()
++        idx = bisect.bisect(self.fibers, (fiberq, start_time))
++        running = start_time
++        top = y + 10
++        bottom = y + 20
++        y += 30
++        self.workchart.create_text((0, top), anchor=NW, text=self.milestone_to_txt(fiberq))
++        now = start_time
++        utilize = 0
++        while now < end_time:
++            if self.fibers[idx][0] != fiberq:
++                break
++            nxt = min(self.fibers[idx][1], end_time)
++            if self.fibers[idx][3] >= 0: # op
++                if self.fibers[idx][4] >= 0: # milestone
++                    text = self.milestone_to_txt(self.fibers[idx][4])
++                elif self.fibers[idx][4] == -1: # receive
++                    text = "Receive"
++                elif self.fibers[idx][4] == -2: # enqueue
++                    text = "Enqueue to %s:%d" % (self.milestone_to_txt(self.fibers[idx][5]),
++                                                 self.fibers[idx][6])
++                    qref.add(self.fibers[idx][5])
++                if self.fibers[idx][3] > 0:
++                    text = "%s: %s" % (self.fibers[idx][3], text)
++                self.workchart.create_line(
++                    (self.time_scale.get(nxt), bottom,
++                     self.time_scale.get(nxt), y))
++                self.workchart.create_text(
++                    (self.time_scale.get(nxt) + 2, y),
++                    anchor=NW,
++                    text=text)
++                y += 10
++            if self.fibers[idx][3] == -1: # enter
++                assert running is None
++                running = nxt
++            if self.fibers[idx][3] == -2: # leave
++                assert running is not None
++                utilize += nxt - running
++                self.workchart.create_rectangle(
++                    (self.time_scale.get(running), top,
++                     self.time_scale.get(nxt), bottom),
++                    fill='red')
++                running = None
++            now = nxt
++            idx += 1
++        if running is not None:
++            utilize += now - running
+             self.workchart.create_rectangle(
+-                (self.time_scale.get(now), 10,
+-                 self.time_scale.get(nxt), 20),
++                (self.time_scale.get(running), top,
++                 self.time_scale.get(now), bottom),
+                 fill='red')
+-            if self.fibers[idx][0] != self.fibers[idx+2][0]:
+-                break
+-            assert self.fibers[idx+1][3]
+-            now = self.fibers[idx+1][1]
+-            idx += 2
+-
++        self.workchart.create_text((0, top + 12), anchor=NW,
++                                   text="%.1f%% cpu" % (utilize * 100. / (end_time - start_time)))
++        return (qref, y)
+ 
+     def button4(self, event):
+         self.time_scale = self.time_scale.anchor_zoom(event.x, 1.2)
+@@ -149,29 +255,108 @@ class BaseOps:
+     def select_op(self, event):
+         self.rerender_op()
+ 
++    def select_milestone(self, event):
++        self.latency.delete(ALL)
++        sel = self.milestonelist.curselection()
++        if len(sel) != 1:
++            return
++        m = self.milestones[sel[0]]
++
++        high = self.milestone_hscale.reverse(1500)
++        self.latency.create_line(
++            (self.milestone_hscale.get(0),    self.milestone_vscale.get(0),
++             self.milestone_hscale.get(high), self.milestone_vscale.get(high)),
++            fill='red')
++        self.latency.create_line(
++            (0, self.milestone_vscale.get(NS_PER_MS),
++             1500, self.milestone_vscale.get(NS_PER_MS)),
++            fill='red')
++        self.latency.create_line(
++            (self.milestone_hscale.get(NS_PER_MS), 0,
++             self.milestone_hscale.get(NS_PER_MS), 800),
++            fill='red')
++
++        for op in self.ops:
++            idx = bisect.bisect(self.fibers, (op[2],))
++            start = None
++            done = None
++            while idx < len(self.fibers) and self.fibers[idx][0] == op[2]:
++                try:
++                    if self.fibers[idx][4] >= 0:
++                        if self.fibers[idx][4] == m:
++                            start = self.fibers[idx][1]
++                        elif start:
++                            done = self.fibers[idx][1]
++                            break
++                except:
++                    pass
++                idx += 1
++            if start:
++                if not done:
++                    done = op[0]
++                x = self.milestone_hscale.get(op[1])
++                y = self.milestone_vscale.get(done - start)
++                self.latency.create_rectangle((x-1, y-1, x+1, y+1))
++
++
+     def render(self, root):
++        self.notebook = ttk.Notebook(root)
++        self.notebook.grid(column=0, row=0, sticky=(N, S, E, W))
++        self.drillframe = ttk.Frame(self.notebook)
++        self.notebook.add(self.drillframe, text="Drill Down")
++
++        self.drillframe.columnconfigure(0, weight=1)
++        self.drillframe.rowconfigure(3, weight=1)
++
+         self.time_scale = LinearScale(self.ops[0][0], 1500. / (self.ops[-1][0] - self.ops[0][0]))
+         high_lat = max([x[1] for x in self.ops])
+         self.latency_scale = LinearScale(high_lat, -200. / high_lat)
++        self.milestone_vscale = LinearScale(high_lat, -800. / high_lat)
++        self.milestone_hscale = LinearScale(0, 1500. / high_lat)
+ 
+-        self.oplist = Listbox(root)
++        self.oplist = Listbox(self.drillframe)
+         self.oplist.grid(column=0, row=0, sticky=(N, W, E, S))
+-        s = ttk.Scrollbar(root, orient=VERTICAL, command=self.oplist.yview)
++        s = ttk.Scrollbar(self.drillframe, orient=VERTICAL, command=self.oplist.yview)
+         s.grid(column=1, row=0, sticky=(N, S))
+         self.oplist['yscrollcommand'] = s.set
+         self.oplist.bind('<<ListboxSelect>>', self.select_op)
+ 
+-        self.canvas = Canvas(root, width=1500, height=200)
++        self.canvas = Canvas(self.drillframe, width=1500, height=200)
+         self.canvas.grid(column=0, row=1, columnspan=2, sticky=(N, W, E, S))
+         self.canvas.bind("<Button-4>", self.button4)
+         self.canvas.bind("<Button-5>", self.button5)
+ 
+-        self.ruler = Canvas(root, height=20)
++        self.ruler = Canvas(self.drillframe, height=20)
+         self.ruler.grid(column=0, row=2, columnspan=2, sticky=(N, W, E, S))
+ 
+-        self.workchart = Canvas(root, height=600)
++        self.workchart = Canvas(self.drillframe, height=600)
+         self.workchart.grid(column=0, row=3, columnspan=2, sticky=(N, W, E, S))
+ 
++        self.correlationframe = ttk.Frame(self.notebook)
++        self.notebook.add(self.correlationframe, text="Correlation")
++
++        self.correlationframe.columnconfigure(0, weight=1)
++        self.correlationframe.rowconfigure(0, weight=1)
++        self.milestonelist = Listbox(self.correlationframe)
++        self.milestonelist.grid(column=0, row=0, sticky=(N, W, E, S))
++        s = ttk.Scrollbar(self.correlationframe, orient=VERTICAL, command=self.milestonelist.yview)
++        s.grid(column=1, row=0, sticky=(N, S))
++        self.milestonelist['yscrollcommand'] = s.set
++        self.milestonelist.bind('<<ListboxSelect>>', self.select_milestone)
++        milestones = set()
++        for f in self.fibers:
++            try:
++                milestones.add(f[4])
++            except:
++                pass
++        self.milestones = [m for m in milestones if m >= 0]
++        self.milestones.sort(key=lambda m: self.milestone_to_txt(m))
++        for m in self.milestones:
++            self.milestonelist.insert(END, self.milestone_to_txt(m))
++
++        self.latency = Canvas(self.correlationframe, width=1500, height=800)
++        self.latency.grid(column=0, row=1, columnspan=2, sticky=(N, W, E, S))
++
+         self.rerender()
+ 
+ def main():
+@@ -185,8 +370,6 @@ def main():
+         raise RuntimeError('Cannot add trace')
+ 
+     root = Tk()
+-    root.columnconfigure(0, weight=1)
+-    root.rowconfigure(3, weight=1)
+ 
+     base = BaseOps(trace)
+     base.render(root)
+diff --git a/tools/pure/tests/benchmark_tests/puretest.py b/tools/pure/tests/benchmark_tests/puretest.py
+index e2421a0..4e905e3 100644
+--- a/tools/pure/tests/benchmark_tests/puretest.py
++++ b/tools/pure/tests/benchmark_tests/puretest.py
+@@ -2221,7 +2221,7 @@ def random_write(kwargs):
+     kwargs = {
+         'testbed': testbed,
+         "volumes": volumes,
+-        'count': 100,
++        'count': 48,
+         'duration': interval * ((maxthreads - initthreads + incrthreads) / incrthreads),
+     }
+     factory.create_observer(collect_queue, kwargs)
